@@ -8,7 +8,7 @@ from xrobotoolkit_teleop.utils.path_utils import ASSET_PATH
 
 def main():
     xml_path = os.path.join(ASSET_PATH, "universal_robots_ur5e/scene_dual_arm.xml")
-    robot_urdf_path = os.path.join(ASSET_PATH, "universal_robots_ur5e/dual_ur5e.urdf")
+    robot_urdf_path = os.path.join(ASSET_PATH, "universal_robots_ur5e/dual_ur5e.xml")
 
     config = {
         "right_hand": {

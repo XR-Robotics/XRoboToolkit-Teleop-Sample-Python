@@ -113,6 +113,13 @@ elif [[ "$1" == "--install" ]]; then
     cd XRoboToolkit-PC-Service-Pybind
     bash setup_ubuntu.sh
 
+    cd ..
+
+    git clone https://github.com/zhigenzhao/placo.git
+    cd placo
+    git checkout xml_experimental
+    bash setup.sh --install
+
     cd ../..
 
     pip install -e . || { echo "Failed to install xrobotoolkit_teleop with pip"; exit 1; }

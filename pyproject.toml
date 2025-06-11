@@ -16,7 +16,7 @@ dependencies = [
     "mujoco",
     "numpy",
     "meshcat",
-    "placo=0.9.4",
+    # "placo=0.9.4",
     "ur_rtde",
     "dynamixel-sdk",
 ]
