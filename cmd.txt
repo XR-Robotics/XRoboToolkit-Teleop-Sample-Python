@@ -1,0 +1,25 @@
+cd ~/codes/XRoboToolkit-Teleop-Sample-Python
+source .venv-calibration/bin/activate
+
+# Quick hardware/env check: should print the RealSense serial.
+python -c "import pyrealsense2 as rs; ctx=rs.context(); print([d.get_info(rs.camera_info.serial_number) for d in ctx.devices])"
+
+# Run this from the Ubuntu desktop terminal if SSH has no display.
+# If you are SSH'd in but want to try the Ubuntu monitor, uncomment:
+# export DISPLAY=:0
+
+# Phase 2: discover/save controller axis remap.  260322271277(right_camera)  
+python scripts/calibration/handeye_sanity_check.py --controller right_controller
+
+cd ~/codes/XRoboToolkit-Teleop-Sample-Python
+source .venv-calibration/bin/activate
+
+python scripts/calibration/handeye_capture.py \
+  --record-dir calibration_data/exp01 \
+  --controller right_controller \
+  --serial 260322271277 \
+  --square-size 0.040 \
+  --pattern 8 11 \
+  --pico-trigger auto
+
+python -c "import pyrealsense2 as rs; ctx=rs.context(); print([d.get_info(rs.camera_info.serial_number) for d in ctx.devices])"

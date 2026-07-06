@@ -50,7 +50,7 @@ import numpy as np
 
 from xrobotoolkit_teleop.common.xr_client import XrClient
 
-from handeye_common import detect_chessboard, write_dataset_config, write_sample
+from handeye_common import detect_chessboard, load_sample, make_object_points, write_dataset_config, write_sample
 
 # Maps a Pico controller to its index-finger trigger key (XrClient.get_key_value_by_name).
 _TRIGGER_FOR_CONTROLLER = {
@@ -198,6 +198,9 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--preview-every", type=int, default=1, help="render preview every Nth loop iteration (1 = full rate).")
     p.add_argument("--min-still-s", type=float, default=0.6, help="min seconds the hand must be still before a capture is accepted.")
+    p.add_argument("--still-pos-m", type=float, default=0.003, help="max pose drift during the still window, in metres.")
+    p.add_argument("--still-rot-deg", type=float, default=1.0, help="max rotation drift during the still window, in degrees.")
+    p.add_argument("--max-reproj-px", type=float, default=0.8, help="max chessboard reprojection RMS allowed for a saved sample.")
     p.add_argument(
         "--pico-trigger",
         default="auto",
@@ -248,6 +251,7 @@ def main() -> None:
         if "error" in intr_msg:
             raise RuntimeError(intr_msg["error"])
         K, dist = intr_msg["K"], intr_msg["dist"]
+        objp = make_object_points(args.square_size, pattern_size)
         print("Camera is hot. Intrinsics:\n", K)
         print("Distortion:", dist.ravel())
 
@@ -264,7 +268,7 @@ def main() -> None:
         if samples:
             print(f"Resuming: {len(samples)} existing sample(s) in {record_dir}; next index = {next_index}.")
 
-        prev_pose = None
+        still_ref_pose = None
         still_since = None
         loop_i = 0
         trig_armed = True  # rising-edge / hysteresis state for the Pico trigger
@@ -287,14 +291,13 @@ def main() -> None:
                         break
                     continue
 
-                # stillness detection (positional + small rotational proxy)
-                still = _is_still(prev_pose, pose)
-                prev_pose = pose
-                if still:
-                    if still_since is None:
-                        still_since = time.monotonic()
-                else:
-                    still_since = None
+                # Stillness detection against a fixed reference pose for the whole
+                # still window, not just consecutive frame deltas.
+                if still_ref_pose is None or not _pose_within_tolerance(
+                    still_ref_pose, pose, args.still_pos_m, args.still_rot_deg
+                ):
+                    still_ref_pose = pose
+                    still_since = time.monotonic()
                 still_ok = still_since is not None and (time.monotonic() - still_since) >= args.min_still_s
 
                 if loop_i % max(1, args.preview_every) == 0:
@@ -318,15 +321,27 @@ def main() -> None:
                     if not still_ok:
                         print(f"  [skip] hand not still enough -- hold steady for ~1 s, then {capture_hint} again.")
                         continue
-                    ok, corners = detect_chessboard(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY), pattern_size)
-                    if not ok:
-                        print("  [skip] chessboard not detected in this frame -- re-aim and retry.")
-                        continue
                     # re-grab the freshest frame + pose at the same instant to minimise skew
                     frame_bgr, cam_ts = read_latest_frame(buf_view, seq, ts_us)
                     pose_now = xr.get_pose_by_name(args.controller)
                     if not _pose_has_valid_quat(pose_now):
                         print(f"  [skip] {args.controller} pose became invalid -- wake/track the controller and retry.")
+                        continue
+                    board_ok, reproj_rms = _chessboard_reprojection_rms(frame_bgr, pattern_size, objp, K, dist)
+                    if not board_ok:
+                        print("  [skip] chessboard not detected in the saved frame -- re-aim and retry.")
+                        continue
+                    if reproj_rms > args.max_reproj_px:
+                        print(
+                            f"  [skip] chessboard reprojection RMS {reproj_rms:.2f}px > "
+                            f"{args.max_reproj_px:.2f}px -- avoid blur/edge views."
+                        )
+                        continue
+                    if samples and _pose_matches_last_sample(record_dir, samples[-1], pose_now):
+                        print(
+                            f"  [skip] {args.controller} pose is unchanged from the previous sample -- "
+                            "move/retrack the controller before capturing."
+                        )
                         continue
                     src = "trigger" if trigger_rising else "SPACE"
                     meta = {
@@ -409,16 +424,56 @@ def _pose_has_valid_quat(pose) -> bool:
     return arr.shape[0] >= 7 and np.linalg.norm(arr[3:7]) > 1e-8
 
 
-def _is_still(pose_a, pose_b, pos_tol_m=0.003, rot_tol=1e-2) -> bool:
-    """Cheap stillness test between two consecutive Pico poses (positional + quat-norm proxy)."""
+def _pose_within_tolerance(pose_a, pose_b, pos_tol_m: float, rot_tol_deg: float) -> bool:
+    """True when two Pico poses are within a small translation/rotation window."""
     if pose_a is None or pose_b is None or not _pose_has_valid_quat(pose_a) or not _pose_has_valid_quat(pose_b):
         return False
     a = np.asarray(pose_a, dtype=np.float64)
     b = np.asarray(pose_b, dtype=np.float64)
     if np.linalg.norm(a[:3] - b[:3]) > pos_tol_m:
         return False
-    # quaternion closeness: |q1 . q2| close to 1 (handle double cover)
-    dot = abs(float(np.dot(a[3:], b[3:])))
+    qa = a[3:] / np.linalg.norm(a[3:])
+    qb = b[3:] / np.linalg.norm(b[3:])
+    dot = np.clip(abs(float(np.dot(qa, qb))), -1.0, 1.0)
+    rot_deg = float(np.degrees(2.0 * np.arccos(dot)))
+    return rot_deg <= rot_tol_deg
+
+
+def _chessboard_reprojection_rms(
+    frame_bgr: np.ndarray,
+    pattern_size,
+    objp: np.ndarray,
+    K: np.ndarray,
+    dist: np.ndarray,
+) -> tuple[bool, float]:
+    """Detect the board on the exact saved frame and reject bad corner fits."""
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    ok, corners = detect_chessboard(gray, pattern_size)
+    if not ok or corners is None:
+        return False, float("inf")
+    ok, rvec, tvec = cv2.solvePnP(objp, corners, K, dist, flags=cv2.SOLVEPNP_ITERATIVE)
+    if not ok:
+        return False, float("inf")
+    projected, _ = cv2.projectPoints(objp, rvec, tvec, K, dist)
+    err = np.linalg.norm(projected.reshape(-1, 2) - corners.reshape(-1, 2), axis=1)
+    return True, float(np.sqrt(np.mean(err * err)))
+
+
+def _pose_matches_last_sample(record_dir: Path, last_sample: Path, pose, pos_tol_m=0.001, rot_tol=1e-5) -> bool:
+    """True when the new pose is effectively a duplicate of the last saved sample."""
+    try:
+        prev = load_sample(record_dir / last_sample.name if not last_sample.is_absolute() else last_sample)[
+            "pico_pose_xyzq"
+        ]
+    except Exception:
+        return False
+    if not _pose_has_valid_quat(prev) or not _pose_has_valid_quat(pose):
+        return False
+    a = np.asarray(prev, dtype=np.float64)
+    b = np.asarray(pose, dtype=np.float64)
+    if np.linalg.norm(a[:3] - b[:3]) > pos_tol_m:
+        return False
+    dot = abs(float(np.dot(a[3:] / np.linalg.norm(a[3:]), b[3:] / np.linalg.norm(b[3:]))))
     return dot > 1.0 - rot_tol
 
 
