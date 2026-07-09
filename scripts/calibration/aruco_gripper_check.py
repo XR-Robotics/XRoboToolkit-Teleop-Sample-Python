@@ -1,0 +1,214 @@
+"""Cross-check Pico gripper tracking against ArUco vision, per episode.
+
+Each arm's wrist camera sees a single static ArUco tag on the table at the start
+and end of the episode. We solve the gripper pose in the tag (scene) frame two
+independent ways:
+
+    vision : solvePnP(tag) -> T_optcam_tag  ->  (URDF camera_link->gripper)
+    pico   : recorded controller pose        ->  (URDF pico_link->gripper)
+
+We anchor the two world frames (tag-world vs Pico-world) using the FIRST frame,
+then report the mismatch at the LAST frame. That mismatch is the accumulated Pico
+tracking drift over the episode (plus any calibration / frame-convention error) --
+i.e. a metric ground-truth check on the tracker, using no robot.
+
+On session_20260709_141300/episode_002 this reports ~4 mm (right) / ~10 mm (left)
+of drift over 25 s, consistent with the known ~8 mm Pico tracking floor, and it
+validates that the URDF camera_link is (to within that floor) the optical frame.
+
+Defaults match the dual-YAM rig:
+    right arm -> cam0 (right_cam), tag id 15
+    left  arm -> cam1 (left_cam),  tag id 19
+    DICT_4X4_50, 152 mm markers.
+
+Usage:
+    python scripts/calibration/aruco_gripper_check.py \
+        --episode /path/session_XXXX/episode_002 \
+        --urdf /path/dual_yam/dual_yam.urdf
+
+Env: opencv-contrib-python (cv2.aruco), numpy. Run in the sim/vision venv, not
+the numpy-2.3 conda base.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import xml.etree.ElementTree as ET
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+
+# --- per-arm rig mapping (dual-YAM defaults) ---------------------------------
+ARM_DEFAULTS = {
+    "right": dict(cam="cam0", cam_role="right_cam", tag=15,
+                  pose="right_pose", valid="right_valid",
+                  joint_cam="right_jointcamera", joint_pico="right_joint_pico"),
+    "left": dict(cam="cam1", cam_role="left_cam", tag=19,
+                 pose="left_pose", valid="left_valid",
+                 joint_cam="left_jointcamera", joint_pico="left_joint_pico"),
+}
+
+
+# --- small SE(3) helpers -----------------------------------------------------
+def rpy_to_R(r, p, y):
+    """URDF fixed-axis roll-pitch-yaw -> rotation matrix (Rz*Ry*Rx)."""
+    cr, sr = np.cos(r), np.sin(r)
+    cp, sp = np.cos(p), np.sin(p)
+    cy, sy = np.cos(y), np.sin(y)
+    Rx = np.array([[1, 0, 0], [0, cr, -sr], [0, sr, cr]])
+    Ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
+    Rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
+    return Rz @ Ry @ Rx
+
+
+def pose7_to_T(pose7):
+    """[x,y,z, qx,qy,qz,qw] -> 4x4."""
+    x, y, z, qx, qy, qz, qw = [float(v) for v in pose7[:7]]
+    n = np.sqrt(qx * qx + qy * qy + qz * qz + qw * qw) or 1.0
+    qx, qy, qz, qw = qx / n, qy / n, qz / n, qw / n
+    T = np.eye(4)
+    T[:3, :3] = np.array([
+        [1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qw * qz), 2 * (qx * qz + qw * qy)],
+        [2 * (qx * qy + qw * qz), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qw * qx)],
+        [2 * (qx * qz - qw * qy), 2 * (qy * qz + qw * qx), 1 - 2 * (qx * qx + qy * qy)],
+    ])
+    T[:3, 3] = [x, y, z]
+    return T
+
+
+def rot_angle(Ta, Tb):
+    R = Ta[:3, :3].T @ Tb[:3, :3]
+    return float(np.degrees(np.arccos(np.clip((np.trace(R) - 1) / 2, -1, 1))))
+
+
+def pos_err_mm(Ta, Tb):
+    return float(np.linalg.norm(Ta[:3, 3] - Tb[:3, 3]) * 1000)
+
+
+# --- inputs ------------------------------------------------------------------
+def joint_T(root, name):
+    for j in root.iter("joint"):
+        if j.get("name") == name:
+            o = j.find("origin")
+            xyz = [float(v) for v in o.get("xyz").split()]
+            rpy = [float(v) for v in o.get("rpy").split()]
+            T = np.eye(4)
+            T[:3, :3] = rpy_to_R(*rpy)
+            T[:3, 3] = xyz
+            return T
+    raise KeyError(f"joint {name} not in URDF")
+
+
+def load_intrinsics(episode: Path, role: str):
+    meta = json.loads((episode / "cameras" / "metadata.json").read_text())
+    intr = meta["camera_config_data"]["roles"][role]["intrinsics"]
+    K = np.array([[intr["fx"], 0, intr["ppx"]], [0, intr["fy"], intr["ppy"]], [0, 0, 1]], float)
+    dist = np.array(intr["coeffs"], float)
+    return K, dist
+
+
+def read_frame(mp4: Path, which: str):
+    """which in {'first','last'}: return the frame as BGR ndarray."""
+    cap = cv2.VideoCapture(str(mp4))
+    if which == "first":
+        ok, frame = cap.read()
+        cap.release()
+        return frame if ok else None
+    n = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(n - 1, 0))
+    ok, frame = cap.read()
+    if not ok:  # some codecs won't seek; decode through
+        cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+        frame = None
+        while True:
+            ok, f = cap.read()
+            if not ok:
+                break
+            frame = f
+    cap.release()
+    return frame
+
+
+def solve_tag(img, K, dist, dict_id, tag_id, marker_size):
+    det = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dict_id),
+                                  cv2.aruco.DetectorParameters())
+    corners, ids, _ = det.detectMarkers(img)
+    if ids is None:
+        return None
+    ids = ids.flatten().tolist()
+    if tag_id not in ids:
+        return None
+    c = corners[ids.index(tag_id)][0]
+    h = marker_size / 2
+    objp = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
+    ok, rvec, tvec = cv2.solvePnP(objp, c, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+    if not ok:
+        return None
+    T = np.eye(4)
+    T[:3, :3] = cv2.Rodrigues(rvec)[0]
+    T[:3, 3] = tvec.flatten()
+    return T  # T_optcam_tag
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--episode", type=Path, required=True)
+    ap.add_argument("--urdf", type=Path, required=True)
+    ap.add_argument("--arms", nargs="+", default=["right", "left"], choices=["right", "left"])
+    ap.add_argument("--marker-size", type=float, default=0.152, help="ArUco square size (m)")
+    ap.add_argument("--dict", default="DICT_4X4_50", help="cv2.aruco dictionary name")
+    args = ap.parse_args()
+
+    episode = args.episode.expanduser().resolve()
+    root = ET.parse(str(args.urdf.expanduser().resolve())).getroot()
+    dict_id = getattr(cv2.aruco, args.dict)
+    pico = dict(np.load(episode / "lowdim" / "pico_controllers.npz"))
+
+    print(f"episode: {episode.name}   dict: {args.dict}   marker: {args.marker_size*1000:.0f}mm\n")
+    for arm in args.arms:
+        c = ARM_DEFAULTS[arm]
+        # URDF fixed transforms: gripper->camera_link (joint_cam), camera_link->pico (joint_pico)
+        T_g_cam = joint_T(root, c["joint_cam"])
+        T_cam_pico = joint_T(root, c["joint_pico"])
+        T_cam_g = np.linalg.inv(T_g_cam)
+        T_pico_g = np.linalg.inv(T_g_cam @ T_cam_pico)
+
+        K, dist = load_intrinsics(episode, c["cam_role"])
+        poses = np.asarray(pico[c["pose"]], float)
+        valid = np.asarray(pico[c["valid"]]).astype(bool)
+        i0 = int(np.argmax(valid))
+        iN = len(valid) - 1 - int(np.argmax(valid[::-1]))
+
+        got = {}
+        for end, i in [("first", i0), ("last", iN)]:
+            img = read_frame(episode / "cameras" / c["cam"] / "color.mp4", end)
+            if img is None:
+                print(f"[{arm}] {end}: could not read frame")
+                continue
+            T_oc_tag = solve_tag(img, K, dist, dict_id, c["tag"], args.marker_size)
+            if T_oc_tag is None:
+                print(f"[{arm}] {end}: tag {c['tag']} not detected in {c['cam']}")
+                continue
+            T_tag_g_vis = np.linalg.inv(T_oc_tag) @ T_cam_g          # optical==camera_link
+            T_pw_g_pico = pose7_to_T(poses[i]) @ T_pico_g
+            got[end] = (T_tag_g_vis, T_pw_g_pico)
+
+        if "first" not in got or "last" not in got:
+            print(f"[{arm}] need both first & last tag detections; skipping\n")
+            continue
+        (Tv0, Tp0), (TvN, TpN) = got["first"], got["last"]
+        T_tag_pw = Tv0 @ np.linalg.inv(Tp0)                          # anchor worlds at t0
+        moved = np.linalg.norm(TvN[:3, 3] - Tv0[:3, 3]) * 1000       # how far the gripper moved
+        drift_pos = pos_err_mm(TvN, T_tag_pw @ TpN)
+        drift_rot = rot_angle(TvN, T_tag_pw @ TpN)
+        print(f"[{arm}] gripper moved {moved:.0f}mm start->end")
+        print(f"[{arm}] t0 anchor residual : {pos_err_mm(Tv0, T_tag_pw @ Tp0):.2f}mm "
+              f"{rot_angle(Tv0, T_tag_pw @ Tp0):.2f}deg  (should be ~0)")
+        print(f"[{arm}] tN Pico drift vs vision : {drift_pos:.1f}mm  {drift_rot:.2f}deg\n")
+
+
+if __name__ == "__main__":
+    main()
