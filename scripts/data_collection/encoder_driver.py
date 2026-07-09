@@ -195,14 +195,14 @@ class EncoderCalibration:
         raw_open = float(self.raw_open)
         raw_closed = float(self.raw_closed)
 
-        if raw_open <= raw_closed:
-            wrap_threshold = (raw_closed + RAW_FULL_SCALE) / 2.0
-            if raw_value > wrap_threshold:
-                raw_value -= RAW_FULL_SCALE
-        elif raw_closed <= raw_open:
-            wrap_threshold = raw_closed / 2.0
-            if raw_value < wrap_threshold:
-                raw_value += RAW_FULL_SCALE
+        # The seam (0/RAW_FULL_SCALE) sits at the smaller endpoint. A reading
+        # that dips just past that endpoint wraps up near RAW_FULL_SCALE; fold
+        # such high values back down (to negative, just past the endpoint)
+        # before the linear map. Matches yam_umi gripper/encoder.py.
+        larger = max(raw_open, raw_closed)
+        wrap_threshold = (larger + RAW_FULL_SCALE) / 2.0
+        if raw_value > wrap_threshold:
+            raw_value -= RAW_FULL_SCALE
 
         span = raw_open - raw_closed
         return float(np.clip((raw_value - raw_closed) / span, 0.0, 1.0))
