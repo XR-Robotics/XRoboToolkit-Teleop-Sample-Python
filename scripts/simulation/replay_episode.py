@@ -154,11 +154,19 @@ def encoder_width_series(enc: dict, flip: bool = False) -> tuple[np.ndarray, np.
     """
     ts = enc["timestamp"].astype(np.float64)
 
-    if "metric" in enc:
+    if "metric" in enc:  # calibrated absolute stroke (metres) -> physically accurate
         m = np.asarray(enc["metric"], dtype=np.float64)
         if np.isfinite(m).mean() > 0.5 and np.nanmax(m) > 1e-4:
             per_finger = np.clip(np.nan_to_num(m) * 0.5, 0.0, GRIPPER_FINGER_MAX)
             return ts, per_finger
+
+    if "normalized" in enc:  # endpoint-calibrated [0,1] (correct dir/range, no mm)
+        nz = np.asarray(enc["normalized"], dtype=np.float64)
+        if np.isfinite(nz).mean() > 0.5 and (np.nanmax(nz) - np.nanmin(nz)) > 0.05:
+            norm = np.clip(np.nan_to_num(nz), 0.0, 1.0)
+            if flip:
+                norm = 1.0 - norm
+            return ts, norm * GRIPPER_FINGER_MAX
 
     raw = np.asarray(enc["raw"], dtype=np.float64)
     if len(raw) < 2:
