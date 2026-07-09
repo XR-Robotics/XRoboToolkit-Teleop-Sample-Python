@@ -22,8 +22,13 @@ except ImportError:
 
 
 USB_SERIAL_RE = re.compile(r"(?:SER|SERIAL)=([^ ]+)", re.IGNORECASE)
-REG_SINGLE_TURN = 0x0000
-RAW_FULL_SCALE = 1024
+# BRT Modbus registers (manual p.12).
+REG_SINGLE_TURN = 0x0000   # single-turn value — gripper position
+REG_RESET_ZERO = 0x0008    # write 1 -> current position becomes raw 0 (persistent)
+REG_SET_MIDPOINT = 0x000E  # write 1 -> current position becomes midpoint (persistent)
+# Raw single-turn wraps at this value. Must match the encoder resolution: this
+# rig's encoder is 12-bit (0..4095, wraps at 4096); yam_umi's BRT is 10-bit (1024).
+RAW_FULL_SCALE = 4096
 
 
 def usb_serial_from_port_info(port_info) -> str:
@@ -124,6 +129,42 @@ def read_raw(inst: "minimalmodbus.Instrument") -> int | None:
         return inst.read_register(REG_SINGLE_TURN, functioncode=3)
     except Exception:
         return None
+
+
+def reset_zero(inst: "minimalmodbus.Instrument") -> None:
+    """Hardware zero-set: the current position becomes raw 0 (persistent).
+
+    Stored in the encoder itself. Use it when the zero point sits inside the
+    gripper travel, which makes raw readings jump/wrap across the 0/RAW_FULL_SCALE
+    boundary. Move to an endpoint (fully CLOSED) first, then zero, so the whole
+    stroke stays in one non-wrapping region. NOTE: shifts every raw value, so any
+    saved raw_open/raw_closed calibration is invalidated and must be re-recorded.
+    """
+    inst.write_register(REG_RESET_ZERO, 1, functioncode=6)
+
+
+def set_midpoint(inst: "minimalmodbus.Instrument") -> None:
+    """Hardware midpoint-set: current position becomes the midpoint (persistent)."""
+    inst.write_register(REG_SET_MIDPOINT, 1, functioncode=6)
+
+
+def probe_ports(*, baudrate: int = 9600, slave_addr: int = 1) -> list[tuple[str, int | None]]:
+    """Probe every serial port, return (port, raw) — raw is None if no response.
+
+    Wiggle one gripper and re-run to see which port's raw changes = that side.
+    """
+    if _list_ports is None:
+        return []
+    results: list[tuple[str, int | None]] = []
+    for p in _list_ports.comports():
+        raw = None
+        try:
+            inst = create_instrument(p.device, slave_addr=slave_addr, baudrate=baudrate)
+            raw = read_raw(inst)
+        except Exception:
+            raw = None
+        results.append((p.device, raw))
+    return results
 
 
 class EncoderCalibration:
