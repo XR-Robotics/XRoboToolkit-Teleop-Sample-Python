@@ -278,6 +278,8 @@ def main():
     ap.add_argument("--valid-arm-frac", type=float, default=0.2,
                     help="in auto mode, keep an arm only if this fraction of samples are valid")
     ap.add_argument("--no-viz", action="store_true", help="headless: no meshcat, just residual stats")
+    ap.add_argument("--show-cameras", action="store_true",
+                    help="show the camera-link meshes (the big blue frustums); hidden by default")
     ap.add_argument("--inspect", action="store_true", help="print data/model schema and exit")
     ap.add_argument("--log", type=Path, default=None, help="write per-frame residual csv here")
     args = ap.parse_args()
@@ -367,6 +369,13 @@ def main():
         try:
             from placo_utils.visualization import robot_viz, robot_frame_viz, frame_viz
             vis = robot_viz(robot)
+            if not args.show_cameras:
+                # hide the camera-link meshes (big blue frustums) that clutter the view
+                import pinocchio as pin
+                for go in robot.visual_model.geometryObjects:
+                    if "camera" in go.name.lower():
+                        node = vis.getViewerNodeName(go, pin.GeometryType.VISUAL)
+                        vis.viewer[node].set_property("visible", False)
             import webbrowser
             webbrowser.open(vis.viewer.url())
             time.sleep(1.0)
