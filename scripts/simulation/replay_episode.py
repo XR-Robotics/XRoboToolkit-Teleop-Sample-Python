@@ -131,30 +131,45 @@ def load_encoder(episode: Path, fname: str) -> dict | None:
         return {k: d[k] for k in d.files}
 
 
-def encoder_width_series(enc: dict) -> tuple[np.ndarray, np.ndarray]:
+def _median_filter(x: np.ndarray, k: int = 5) -> np.ndarray:
+    """Simple 1-D median filter to knock out single-sample encoder glitches."""
+    from numpy.lib.stride_tricks import sliding_window_view as swv
+    h = k // 2
+    return np.median(swv(np.pad(x, h, mode="edge"), k), axis=1)
+
+
+def encoder_width_series(enc: dict, flip: bool = False) -> tuple[np.ndarray, np.ndarray]:
     """Return (timestamps, width_per_finger[m]).
 
-    Prefer calibrated 'metric_m' (metres, total stroke) when present & finite;
-    otherwise linearly normalise 'raw' over the episode's observed range. Either
-    way we map to *per-finger* travel in [0, GRIPPER_FINGER_MAX].
+    Prefer the calibrated 'metric' field (metres, total stroke) when it is
+    actually populated. Otherwise decode the RAW 12-bit rotary encoder:
+      1. median-filter to drop single-sample glitches (spurious 0 / 4095),
+      2. **unwrap** modulo 4096 -- the gripper motion crosses the 0/4095 boundary,
+         so without unwrapping adjacent angles look like full-open vs full-close
+         and the fingers flip wildly,
+      3. robust-normalise (2..98 pct) to per-finger travel [0, GRIPPER_FINGER_MAX].
+    Uncalibrated raw gives a *relative* opening (min=closed, max=open); pass
+    flip=True if open/close come out reversed. For true mm, collect an
+    open/close calibration so 'metric' is populated.
     """
     ts = enc["timestamp"].astype(np.float64)
-    if "metric_m" in enc and np.isfinite(enc["metric_m"]).any():
-        total = np.asarray(enc["metric_m"], dtype=np.float64)
-        total = np.nan_to_num(total, nan=0.0)
-        # metric_m is total opening; per finger = half, clipped to travel.
-        per_finger = np.clip(total * 0.5, 0.0, GRIPPER_FINGER_MAX)
-    else:
-        raw = np.asarray(enc["raw"], dtype=np.float64)
-        valid = raw >= 0
-        if valid.sum() < 2:
-            per_finger = np.zeros_like(raw)
-        else:
-            lo, hi = np.percentile(raw[valid], [2, 98])
-            span = max(hi - lo, 1e-6)
-            norm = np.clip((raw - lo) / span, 0.0, 1.0)
-            per_finger = norm * GRIPPER_FINGER_MAX
-    return ts, per_finger
+
+    if "metric" in enc:
+        m = np.asarray(enc["metric"], dtype=np.float64)
+        if np.isfinite(m).mean() > 0.5 and np.nanmax(m) > 1e-4:
+            per_finger = np.clip(np.nan_to_num(m) * 0.5, 0.0, GRIPPER_FINGER_MAX)
+            return ts, per_finger
+
+    raw = np.asarray(enc["raw"], dtype=np.float64)
+    if len(raw) < 2:
+        return ts, np.zeros_like(raw)
+    med = _median_filter(raw, 5)
+    unwrapped = np.unwrap(med / 4096.0 * 2 * np.pi) / (2 * np.pi) * 4096.0
+    lo, hi = np.percentile(unwrapped, [2, 98])
+    norm = np.clip((unwrapped - lo) / max(hi - lo, 1e-6), 0.0, 1.0)
+    if flip:
+        norm = 1.0 - norm
+    return ts, norm * GRIPPER_FINGER_MAX
 
 
 def nearest(ts: np.ndarray, t: float) -> int:
@@ -273,6 +288,8 @@ def main():
                          "start: pin first frame to FK(q0)")
     ap.add_argument("--reach", type=float, default=0.40,
                     help="target centroid distance from arm base (m), for --anchor center")
+    ap.add_argument("--gripper-flip", action="store_true",
+                    help="reverse encoder open/close (uncalibrated raw has unknown polarity)")
     ap.add_argument("--speed", type=float, default=1.0, help="playback speed (1.0=real time)")
     ap.add_argument("--q0-scale", type=float, default=1.0, help="scale the default ready pose")
     ap.add_argument("--valid-arm-frac", type=float, default=0.2,
@@ -361,7 +378,7 @@ def main():
     enc_series = {}
     for arm in arms:
         enc = load_encoder(episode, ARMS[arm]["encoder"])
-        enc_series[arm] = encoder_width_series(enc) if enc is not None else None
+        enc_series[arm] = encoder_width_series(enc, args.gripper_flip) if enc is not None else None
 
     # ---- viz ---------------------------------------------------------------
     vis = None
