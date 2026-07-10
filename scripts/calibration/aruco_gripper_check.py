@@ -16,15 +16,18 @@ On session_20260709_141300/episode_002 this reports ~4 mm (right) / ~10 mm (left
 of drift over 25 s, consistent with the known ~8 mm Pico tracking floor, and it
 validates that the URDF camera_link is (to within that floor) the optical frame.
 
-Defaults match the dual-YAM rig:
-    right arm -> cam0 (right_cam), tag id 15
-    left  arm -> cam1 (left_cam),  tag id 19
-    DICT_4X4_50, 152 mm markers.
+Rig mapping: right arm -> cam0 (right_cam), left arm -> cam1 (left_cam). Each
+wrist camera sees one tag, so tag ids are auto-detected (--right-tag/--left-tag
+to pin). Tag family via --tag-family:
+    apriltag16h5 (default): DICT_APRILTAG_16h5, 150 mm  -- new collections
+    aruco4x4              : DICT_4X4_50,        152 mm  -- the earlier sessions
 
 Usage:
+    # new AprilTag sessions
     python scripts/calibration/aruco_gripper_check.py \
-        --episode /path/session_XXXX/episode_002 \
-        --urdf /path/dual_yam/dual_yam.urdf
+        --episode /path/session_XXXX/episode_002 --urdf /path/dual_yam.urdf
+    # older ArUco sessions
+    python scripts/calibration/aruco_gripper_check.py ... --tag-family aruco4x4
 
 Env: opencv-contrib-python (cv2.aruco), numpy. Run in the sim/vision venv, not
 the numpy-2.3 conda base.
@@ -43,12 +46,20 @@ import numpy as np
 
 # --- per-arm rig mapping (dual-YAM defaults) ---------------------------------
 ARM_DEFAULTS = {
-    "right": dict(cam="cam0", cam_role="right_cam", tag=15,
+    "right": dict(cam="cam0", cam_role="right_cam",
                   pose="right_pose", valid="right_valid",
                   joint_cam="right_jointcamera", joint_pico="right_joint_pico"),
-    "left": dict(cam="cam1", cam_role="left_cam", tag=19,
+    "left": dict(cam="cam1", cam_role="left_cam",
                  pose="left_pose", valid="left_valid",
                  joint_cam="left_jointcamera", joint_pico="left_joint_pico"),
+}
+
+# Tag families. Each wrist camera sees one tag, so the id is auto-detected by
+# default (--right-tag/--left-tag to pin). apriltag16h5 is the new default;
+# aruco4x4 kept for the earlier sessions (DICT_4X4_50, 152mm, right=15/left=19).
+TAG_PRESETS = {
+    "apriltag16h5": {"dict": "DICT_APRILTAG_16h5", "marker_size": 0.15},
+    "aruco4x4": {"dict": "DICT_4X4_50", "marker_size": 0.152},
 }
 
 
@@ -133,15 +144,24 @@ def read_frame(mp4: Path, which: str):
 
 
 def solve_tag(img, K, dist, dict_id, tag_id, marker_size):
+    """Return (T_optcam_tag, detected_id) or None.
+
+    tag_id None => auto: use the largest-area detected marker (each wrist camera
+    sees a single tag; largest-area rejects spurious 16h5 detections).
+    """
     det = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dict_id),
                                   cv2.aruco.DetectorParameters())
     corners, ids, _ = det.detectMarkers(img)
-    if ids is None:
+    if ids is None or len(ids) == 0:
         return None
     ids = ids.flatten().tolist()
-    if tag_id not in ids:
+    if tag_id is None:
+        k = int(np.argmax([cv2.contourArea(corners[j][0]) for j in range(len(ids))]))
+    elif tag_id in ids:
+        k = ids.index(tag_id)
+    else:
         return None
-    c = corners[ids.index(tag_id)][0]
+    c = corners[k][0]
     h = marker_size / 2
     objp = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
     ok, rvec, tvec = cv2.solvePnP(objp, c, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
@@ -150,7 +170,7 @@ def solve_tag(img, K, dist, dict_id, tag_id, marker_size):
     T = np.eye(4)
     T[:3, :3] = cv2.Rodrigues(rvec)[0]
     T[:3, 3] = tvec.flatten()
-    return T  # T_optcam_tag
+    return T, ids[k]  # T_optcam_tag, detected id
 
 
 def main():
@@ -158,18 +178,27 @@ def main():
     ap.add_argument("--episode", type=Path, required=True)
     ap.add_argument("--urdf", type=Path, required=True)
     ap.add_argument("--arms", nargs="+", default=["right", "left"], choices=["right", "left"])
-    ap.add_argument("--marker-size", type=float, default=0.152, help="ArUco square size (m)")
-    ap.add_argument("--dict", default="DICT_4X4_50", help="cv2.aruco dictionary name")
+    ap.add_argument("--tag-family", default="apriltag16h5", choices=list(TAG_PRESETS),
+                    help="tag preset (apriltag16h5=new default; aruco4x4=old sessions)")
+    ap.add_argument("--marker-size", type=float, default=None, help="override marker square size (m)")
+    ap.add_argument("--dict", default=None, help="override cv2.aruco dictionary name")
+    ap.add_argument("--right-tag", default="auto", help="right tag id, or 'auto' (largest marker)")
+    ap.add_argument("--left-tag", default="auto", help="left tag id, or 'auto'")
     args = ap.parse_args()
 
     episode = args.episode.expanduser().resolve()
     root = ET.parse(str(args.urdf.expanduser().resolve())).getroot()
-    dict_id = getattr(cv2.aruco, args.dict)
+    preset = TAG_PRESETS[args.tag_family]
+    dict_name = args.dict or preset["dict"]
+    marker_size = args.marker_size or preset["marker_size"]
+    dict_id = getattr(cv2.aruco, dict_name)
+    tag_ids = {"right": args.right_tag, "left": args.left_tag}
     pico = dict(np.load(episode / "lowdim" / "pico_controllers.npz"))
 
-    print(f"episode: {episode.name}   dict: {args.dict}   marker: {args.marker_size*1000:.0f}mm\n")
+    print(f"episode: {episode.name}   dict: {dict_name}   marker: {marker_size*1000:.0f}mm\n")
     for arm in args.arms:
         c = ARM_DEFAULTS[arm]
+        tag_id = None if str(tag_ids[arm]).lower() == "auto" else int(tag_ids[arm])
         # URDF fixed transforms: gripper->camera_link (joint_cam), camera_link->pico (joint_pico)
         T_g_cam = joint_T(root, c["joint_cam"])
         T_cam_pico = joint_T(root, c["joint_pico"])
@@ -188,10 +217,13 @@ def main():
             if img is None:
                 print(f"[{arm}] {end}: could not read frame")
                 continue
-            T_oc_tag = solve_tag(img, K, dist, dict_id, c["tag"], args.marker_size)
-            if T_oc_tag is None:
-                print(f"[{arm}] {end}: tag {c['tag']} not detected in {c['cam']}")
+            res = solve_tag(img, K, dist, dict_id, tag_id, marker_size)
+            if res is None:
+                want = "any tag" if tag_id is None else f"tag {tag_id}"
+                print(f"[{arm}] {end}: {want} not detected in {c['cam']}")
                 continue
+            T_oc_tag, det_id = res
+            print(f"[{arm}] {end}: tag id {det_id}")
             T_tag_g_vis = np.linalg.inv(T_oc_tag) @ T_cam_g          # optical==camera_link
             T_pw_g_pico = pose7_to_T(poses[i]) @ T_pico_g
             got[end] = (T_tag_g_vis, T_pw_g_pico)
