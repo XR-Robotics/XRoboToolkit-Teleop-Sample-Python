@@ -57,8 +57,16 @@ ARM_DEFAULTS = {
 # Tag families. Each wrist camera sees one tag, so the id is auto-detected by
 # default (--right-tag/--left-tag to pin). apriltag16h5 is the new default;
 # aruco4x4 kept for the earlier sessions (DICT_4X4_50, 152mm, right=15/left=19).
+#
+# SIZE PITFALL: marker_size is the BLACK square edge, which is what OpenCV's
+# corners delimit. A tag16h5 print is 8x8 modules (6x6 black + 1-module white
+# border), so a "15x15cm" printed tag has a 15*6/8 = 11.25cm black square.
+# Getting this wrong scales every PnP distance by the same ratio (~33% here,
+# -> ~100mm trajectory error). Verified against Pico on session_20260710_151337:
+# scale fit gave true size 112.4/111.1mm for the two tags. Measure the black
+# square with a ruler if in doubt.
 TAG_PRESETS = {
-    "apriltag16h5": {"dict": "DICT_APRILTAG_16h5", "marker_size": 0.15},
+    "apriltag16h5": {"dict": "DICT_APRILTAG_16h5", "marker_size": 0.1125},
     "aruco4x4": {"dict": "DICT_4X4_50", "marker_size": 0.152},
 }
 

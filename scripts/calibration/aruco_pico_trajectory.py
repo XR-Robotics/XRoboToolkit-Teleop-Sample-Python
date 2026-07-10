@@ -37,13 +37,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import aruco_gripper_check as agc  # noqa: E402
 
 
-def tag_candidates(img, K, dist, dict_id, tag_id, marker_size,
-                   max_reproj=4.0, max_dist=2.0):
-    """Return (marker_id, [T_optcam_tag, ...]) — up to the 2 IPPE_SQUARE
-    solutions of the planar-square ambiguity, gated on reprojection + distance.
-    The caller disambiguates by temporal continuity. None if no valid tag."""
-    det = cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dict_id),
-                                  cv2.aruco.DetectorParameters())
+def make_detector(dict_id):
+    params = cv2.aruco.DetectorParameters()
+    # sub-pixel corners: PnP rotation noise scales directly with corner noise
+    params.cornerRefinementMethod = cv2.aruco.CORNER_REFINE_SUBPIX
+    return cv2.aruco.ArucoDetector(cv2.aruco.getPredefinedDictionary(dict_id), params)
+
+
+def pick_tag_corners(det, img, tag_id):
+    """Detect and return (marker_id, 4x2 corners) for the pinned id, or the
+    largest marker when tag_id is None. None if nothing detected."""
     corners, ids, _ = det.detectMarkers(img)
     if ids is None or len(ids) == 0:
         return None
@@ -54,27 +57,94 @@ def tag_candidates(img, K, dist, dict_id, tag_id, marker_size,
         k = ids.index(tag_id)
     else:
         return None
-    c = corners[k][0]
-    h = marker_size / 2
-    objp = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
-    try:
-        n, rvecs, tvecs, reproj = cv2.solvePnPGeneric(
-            objp, c, K, dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
-    except cv2.error:
+    return ids[k], corners[k][0]
+
+
+class TagPoseTracker:
+    """Temporally-coherent single-tag PnP.
+
+    A planar square has two mirror IPPE poses whose reprojection errors are
+    often nearly equal under oblique views, so picking per-frame by reprojection
+    lets the solution flip/wander between mirror branches. The rotation error is
+    then amplified by the camera-to-tag distance (lever arm): at 0.7 m, 40 deg of
+    wander = ~500 mm of camera-position error. Measured on
+    session_20260710_151337: vision inter-frame rotation p95 was 7.3 deg/frame vs
+    1.6 deg/frame actual (Pico), i.e. mostly PnP noise, not motion.
+
+    Strategy:
+      seed  : IPPE_SQUARE, lowest reprojection
+      track : SOLVEPNP_ITERATIVE refined from the previous frame's pose --
+              stays on the same mirror branch by construction
+      gate  : mean reprojection < max_reproj px, rotation step < max_rot_step
+      reseed: after `reseed_after` consecutive rejections, start over with IPPE
+    """
+
+    def __init__(self, K, dist, marker_size, max_reproj=3.0,
+                 max_rot_step_deg=25.0, reseed_after=15):
+        h = marker_size / 2
+        self.objp = np.array([[-h, h, 0], [h, h, 0], [h, -h, 0], [-h, -h, 0]], float)
+        self.K, self.dist = K, dist
+        self.max_reproj = float(max_reproj)
+        self.max_rot = np.radians(max_rot_step_deg)
+        self.reseed_after = int(reseed_after)
+        self.rvec = None
+        self.tvec = None
+        self.misses = 0
+
+    def _reproj_px(self, rvec, tvec, c):
+        proj, _ = cv2.projectPoints(self.objp, rvec, tvec, self.K, self.dist)
+        return float(np.sqrt(((proj.reshape(-1, 2) - c) ** 2).sum(1)).mean())
+
+    def _seed(self, c):
+        try:
+            n, rvecs, tvecs, reproj = cv2.solvePnPGeneric(
+                self.objp, c, self.K, self.dist, flags=cv2.SOLVEPNP_IPPE_SQUARE)
+        except cv2.error:
+            return None
+        if n < 1:
+            return None
+        b = int(np.argmin(np.asarray(reproj, float).flatten()))
+        return (np.asarray(rvecs[b], float).reshape(3, 1),
+                np.asarray(tvecs[b], float).reshape(3, 1))
+
+    def _miss(self):
+        self.misses += 1
+        if self.misses >= self.reseed_after:
+            self.rvec = self.tvec = None
+            self.misses = 0
         return None
-    reproj = np.asarray(reproj, float).flatten()
-    cands = []
-    for j in range(n):
-        tvec = np.asarray(tvecs[j], float).flatten()
-        if reproj[j] > max_reproj or np.linalg.norm(tvec) > max_dist:
-            continue
+
+    def update(self, c):
+        """c: 4x2 marker corners. Returns T_optcam_tag or None (rejected)."""
+        prev = self.rvec
+        if prev is None:
+            got = self._seed(c)
+            if got is None:
+                return None
+            rvec, tvec = got
+        else:
+            ok, rvec, tvec = cv2.solvePnP(
+                self.objp, c, self.K, self.dist,
+                rvec=self.rvec.copy(), tvec=self.tvec.copy(),
+                useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            if not ok:
+                return self._miss()
+            rvec = np.asarray(rvec, float).reshape(3, 1)
+            tvec = np.asarray(tvec, float).reshape(3, 1)
+        if self._reproj_px(rvec, tvec, c) > self.max_reproj:
+            return self._miss()
+        if prev is not None:
+            R0 = cv2.Rodrigues(prev)[0]
+            R1 = cv2.Rodrigues(rvec)[0]
+            ang = np.arccos(np.clip((np.trace(R0.T @ R1) - 1) / 2, -1, 1))
+            if ang > self.max_rot:
+                return self._miss()
+        self.rvec, self.tvec = rvec, tvec
+        self.misses = 0
         T = np.eye(4)
-        T[:3, :3] = cv2.Rodrigues(np.asarray(rvecs[j], float))[0]
-        T[:3, 3] = tvec
-        cands.append((T, float(reproj[j])))
-    if not cands:
-        return None
-    return ids[k], cands
+        T[:3, :3] = cv2.Rodrigues(rvec)[0]
+        T[:3, 3] = np.asarray(tvec, float).flatten()
+        return T
 
 
 def nearest_idx(sorted_ts: np.ndarray, t: float) -> int:
@@ -112,9 +182,9 @@ def collect_arm(episode: Path, root, arm: str, dict_id, tag_id, marker_size, str
     cam_ts = np.load(cam_dir / "color_timestamps.npy").astype(np.float64)
     cap = cv2.VideoCapture(str(cam_dir / "color.mp4"))
 
+    det = make_detector(dict_id)
+    tracker = TagPoseTracker(K, dist, marker_size)
     times, vis_p, vis_T, pico_T = [], [], [], []
-    last_cam_pos = None  # camera-in-tag position of the last accepted frame
-    vmax = 0.15          # max plausible camera move between processed frames (m)
     i = -1
     while True:
         ok, frame = cap.read()
@@ -123,19 +193,13 @@ def collect_arm(episode: Path, root, arm: str, dict_id, tag_id, marker_size, str
         i += 1
         if i % stride or i >= len(cam_ts):
             continue
-        got = tag_candidates(frame, K, dist, dict_id, tag_id, marker_size)
+        got = pick_tag_corners(det, frame, tag_id)
         if got is None:
             continue
-        _, cands = got
-        cam_Ts = [np.linalg.inv(T) for T, _ in cands]  # camera (optical==camera_link) in tag
-        if last_cam_pos is None:  # seed with the lowest-reprojection solution
-            pick = int(np.argmin([rp for _, rp in cands]))
-        else:  # resolve the flip ambiguity by continuity with the previous frame
-            pick = int(np.argmin([np.linalg.norm(ct[:3, 3] - last_cam_pos) for ct in cam_Ts]))
-        T_tag_cam = cam_Ts[pick]
-        if last_cam_pos is not None and np.linalg.norm(T_tag_cam[:3, 3] - last_cam_pos) > vmax:
-            continue  # even the best candidate jumps implausibly -> drop this frame
-        last_cam_pos = T_tag_cam[:3, 3]
+        T_oc_tag = tracker.update(got[1])
+        if T_oc_tag is None:
+            continue
+        T_tag_cam = np.linalg.inv(T_oc_tag)  # camera (optical==camera_link) in tag frame
         t = float(cam_ts[i])
         j = nearest_idx(p_ts, t)
         if not p_valid[j]:
@@ -178,6 +242,11 @@ def main():
     ap.add_argument("--stride", type=int, default=1, help="process every Nth camera frame")
     ap.add_argument("--out", type=Path, default=None, help="save figure(s) to this path stem")
     ap.add_argument("--no-show", action="store_true")
+    ap.add_argument("--animate", action="store_true",
+                    help="play the two trajectories as a growing real-time animation")
+    ap.add_argument("--anim-speed", type=float, default=1.0, help="animation speed multiplier")
+    ap.add_argument("--save-video", type=Path, default=None,
+                    help="save the animation as mp4 (needs ffmpeg); implies --animate")
     args = ap.parse_args()
 
     import matplotlib
@@ -218,11 +287,16 @@ def main():
         te = np.insert(tt, gaps, np.nan)
         ee = np.insert(err_mm, gaps, np.nan)
 
+        animate = args.animate or args.save_video is not None
+
         fig = plt.figure(figsize=(12, 5))
         fig.suptitle(f"{episode.name}  {arm} arm  ({args.align} align, {n}/{cam_frames} frames)")
         ax = fig.add_subplot(1, 2, 1, projection="3d")
-        ax.plot(*vp.T, color="red", lw=1.5, label="camera GT (AprilTag)")
-        ax.plot(*pp.T, color="blue", lw=1.5, label="Pico")
+        # static full tracks (faint) so the animation has context + fixed limits
+        ax.plot(*vp.T, color="red", lw=1.5 if not animate else 0.4,
+                alpha=1.0 if not animate else 0.25, label="camera GT (AprilTag)")
+        ax.plot(*pp.T, color="blue", lw=1.5 if not animate else 0.4,
+                alpha=1.0 if not animate else 0.25, label="Pico")
         ax.scatter(*vis_p[0], color="k", s=30, label="start")
         ax.set_xlabel("x (m)"); ax.set_ylabel("y (m)"); ax.set_zlabel("z (m)")
         ax.legend(loc="upper left", fontsize=8)
@@ -232,11 +306,48 @@ def main():
             pass
 
         ax2 = fig.add_subplot(1, 2, 2)
-        ax2.plot(te, ee, color="purple", lw=1.2)
         ax2.axhline(err_mm.mean(), color="gray", ls="--", lw=0.8, label=f"mean {err_mm.mean():.1f}mm")
         ax2.set_xlabel("time (s)"); ax2.set_ylabel("Pico vs camera error (mm)")
         ax2.set_title("per-frame position error"); ax2.legend(fontsize=8); ax2.grid(alpha=0.3)
+        if animate:
+            ax2.set_xlim(0, np.nanmax(te))
+            ax2.set_ylim(0, np.nanmax(ee) * 1.05)
+        else:
+            ax2.plot(te, ee, color="purple", lw=1.2)
         fig.tight_layout()
+
+        if animate:
+            from matplotlib.animation import FuncAnimation
+
+            lv, = ax.plot([], [], [], color="red", lw=1.8)
+            lp, = ax.plot([], [], [], color="blue", lw=1.8)
+            hv, = ax.plot([], [], [], "o", color="red", ms=6)
+            hp, = ax.plot([], [], [], "o", color="blue", ms=6)
+            le, = ax2.plot([], [], color="purple", lw=1.2)
+            txt = ax2.text(0.02, 0.95, "", transform=ax2.transAxes, fontsize=9, va="top")
+
+            def update(i):
+                lv.set_data_3d(vp[:i + 1, 0], vp[:i + 1, 1], vp[:i + 1, 2])
+                lp.set_data_3d(pp[:i + 1, 0], pp[:i + 1, 1], pp[:i + 1, 2])
+                if np.isfinite(vp[i]).all():
+                    hv.set_data_3d([vp[i, 0]], [vp[i, 1]], [vp[i, 2]])
+                if np.isfinite(pp[i]).all():
+                    hp.set_data_3d([pp[i, 0]], [pp[i, 1]], [pp[i, 2]])
+                le.set_data(te[:i + 1], ee[:i + 1])
+                if np.isfinite(ee[i]):
+                    txt.set_text(f"t={te[i]:5.2f}s   err={ee[i]:6.1f} mm")
+                return lv, lp, hv, hp, le, txt
+
+            dtm = float(np.nanmedian(np.diff(te)))
+            fps = min(60.0, max(5.0, args.anim_speed / max(dtm, 1e-3)))
+            anim = FuncAnimation(fig, update, frames=len(te),
+                                 interval=1000.0 * dtm / args.anim_speed, blit=False)
+            if args.save_video is not None:
+                p = args.save_video.expanduser()
+                p = p.with_name(f"{p.stem}_{arm}{p.suffix or '.mp4'}")
+                anim.save(str(p), fps=fps, dpi=110)
+                print(f"[{arm}] saved video {p}")
+            fig._anim = anim  # keep a reference so plt.show() animates
 
         if args.out is not None:
             p = args.out.expanduser()
