@@ -305,6 +305,11 @@ def main():
     ap.add_argument("--no-viz", action="store_true", help="headless: no meshcat, just residual stats")
     ap.add_argument("--show-cameras", action="store_true",
                     help="show the camera-link meshes (the big blue frustums); hidden by default")
+    ap.add_argument("--gt", action="store_true",
+                    help="overlay camera ground-truth (AprilTag) trail in red vs pico targets in blue")
+    ap.add_argument("--tag-family", default="apriltag16h5",
+                    help="tag preset for --gt (see aruco_gripper_check.TAG_PRESETS)")
+    ap.add_argument("--marker-size", type=float, default=None, help="override tag black-square size (m)")
     ap.add_argument("--inspect", action="store_true", help="print data/model schema and exit")
     ap.add_argument("--log", type=Path, default=None, help="write per-frame residual csv here")
     args = ap.parse_args()
@@ -408,6 +413,76 @@ def main():
             print(f"[warn] viz unavailable ({e}); continuing headless")
             vis = None
 
+    # ---- optional camera ground-truth overlay (red) vs pico targets (blue) ---
+    # Draws both trails as static polylines in meshcat and animates a red sphere
+    # at the AprilTag-solved camera-GT position while the robot follows Pico.
+    gt_tracks = {}  # arm -> (times, world positions of GT pico_link)
+    if args.gt and vis is not None:
+        try:
+            import cv2
+            import meshcat.geometry as mg
+            sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "calibration"))
+            import aruco_gripper_check as agc
+            import aruco_pico_trajectory as apt
+
+            import xml.etree.ElementTree as ET
+            _root = ET.parse(str(urdf)).getroot()
+            preset = agc.TAG_PRESETS[args.tag_family]
+            dict_id = getattr(cv2.aruco, preset["dict"])
+            marker_size = args.marker_size or preset["marker_size"]
+
+            for arm in arms:
+                c = agc.ARM_DEFAULTS[arm]
+                T_camlink_pico = agc.joint_T(_root, c["joint_pico"])
+                K, dist = agc.load_intrinsics(episode, c["cam_role"])
+                cam_dir = episode / "cameras" / c["cam"]
+                cam_ts = np.load(cam_dir / "color_timestamps.npy").astype(np.float64)
+                det = apt.make_detector(dict_id)
+                trk = apt.TagPoseTracker(K, dist, marker_size)
+                cap = cv2.VideoCapture(str(cam_dir / "color.mp4"))
+                gt_T, gt_t = [], []
+                fi = -1
+                while True:
+                    ok, frame = cap.read()
+                    if not ok:
+                        break
+                    fi += 1
+                    if fi >= len(cam_ts):
+                        break
+                    got = apt.pick_tag_corners(det, frame, None)
+                    if got is None:
+                        continue
+                    T_oc_tag = trk.update(got[1])
+                    if T_oc_tag is None:
+                        continue
+                    # GT pico_link pose in the tag frame
+                    gt_T.append(np.linalg.inv(T_oc_tag) @ T_camlink_pico)
+                    gt_t.append(float(cam_ts[fi]))
+                cap.release()
+                if len(gt_T) < 2:
+                    print(f"[gt] {arm}: too few tag detections; skipping overlay")
+                    continue
+                # anchor tag-world -> replay-world with the first GT frame,
+                # matched to the same-time pico target (full SE(3))
+                j0 = nearest(tstamps, gt_t[0])
+                B = targets[arm][j0] @ np.linalg.inv(gt_T[0])
+                pts = np.array([(B @ T)[:3, 3] for T in gt_T])
+                gt_tracks[arm] = (np.array(gt_t), pts)
+                # static trails
+                blue = np.array([targets[arm][k][:3, 3] for k in range(0, len(tstamps), 4)])
+                vis.viewer[f"gt/{arm}/pico_trail"].set_object(
+                    mg.Line(mg.PointsGeometry(blue.T.astype(np.float32)),
+                            mg.LineBasicMaterial(color=0x2255FF)))
+                vis.viewer[f"gt/{arm}/cam_trail"].set_object(
+                    mg.Line(mg.PointsGeometry(pts.T.astype(np.float32)),
+                            mg.LineBasicMaterial(color=0xFF2222)))
+                vis.viewer[f"gt/{arm}/cam_marker"].set_object(
+                    mg.Sphere(0.012), mg.MeshLambertMaterial(color=0xFF2222))
+                print(f"[gt] {arm}: overlay with {len(pts)} GT frames "
+                      f"(red=camera GT, blue=pico target)")
+        except Exception as e:
+            print(f"[warn] GT overlay unavailable ({e})")
+
     # ---- replay loop --------------------------------------------------------
     N = len(tstamps)
     residual_rows = []  # (t, arm, pos_err_mm, rot_err_deg)
@@ -442,6 +517,11 @@ def main():
 
         if vis is not None:
             vis.display(robot.state.q)
+            for arm, (gtt, gtp) in gt_tracks.items():
+                k = nearest(gtt, float(tstamps[i]))
+                Tm = np.eye(4)
+                Tm[:3, 3] = gtp[k]
+                vis.viewer[f"gt/{arm}/cam_marker"].set_transform(Tm)
 
         # real-time pacing
         if i + 1 < N:
